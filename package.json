@@ -1,0 +1,24 @@
+{
+  "name": "tiff-qr-checker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "bun run ./scripts/prepare-node-modules.ts",
+    "check": "bun run src/cli.ts",
+    "build": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker --target bun",
+    "build:win": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker.exe --compile --target=bun-windows-x64-baseline",
+    "build:linux": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker-linux --compile --target=bun-linux-x64-baseline",
+    "build:mac": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker-macos --compile --target=bun-darwin-arm64"
+  },
+  "dependencies": {
+    "@zxing/library": "^0.21.3",
+    "jsqr": "^1.4.0",
+    "utif": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2"
+  }
+}

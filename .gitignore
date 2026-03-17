@@ -1,0 +1,15 @@
+node_modules/
+dist/
+
+scan_*.log
+qrs_*.log
+
+*.tsbuildinfo
+coverage/
+
+.DS_Store
+Thumbs.db
+
+*.tif
+*.tiff
+TestFiles/
