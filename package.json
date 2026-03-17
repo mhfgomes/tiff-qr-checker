@@ -7,7 +7,7 @@
     "postinstall": "bun run ./scripts/prepare-node-modules.ts",
     "check": "bun run src/cli.ts",
     "build": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker --target bun",
-    "build:win": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker.exe --compile --target=bun-windows-x64-baseline",
+    "build:win": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker-win.exe --compile --target=bun-windows-x64-baseline",
     "build:linux": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker-linux --compile --target=bun-linux-x64-baseline",
     "build:mac": "bun build ./src/cli.ts --outfile ./dist/tiff-qr-checker-macos --compile --target=bun-darwin-arm64"
   },
