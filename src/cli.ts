@@ -1,15 +1,6 @@
 import path from "node:path";
 import os from "node:os";
-import jsQR from "../node_modules/jsqr/dist/jsQR.js";
-import * as UTIF from "../node_modules/utif/UTIF.js";
-
-type ScanResult = {
-  filePath: string;
-  hasQrCode: boolean;
-  pageMatches: number[];
-  decodedValues: string[];
-  error?: string;
-};
+import { type ScanMode, type ScanResult } from "./scan-core";
 
 type Logger = {
   path: string;
@@ -18,13 +9,24 @@ type Logger = {
   flush: () => Promise<void>;
 };
 
+type WorkerStats = {
+  workerId: number;
+  filesCompleted: number;
+  activeTimeMs: number;
+};
+
+type PoolStats = {
+  totalWallTimeMs: number;
+  fileTimeMs: number[];
+  workerStats: WorkerStats[];
+};
+
 const TIFF_EXTENSIONS = new Set([".tif", ".tiff"]);
-const QR_SCALES = [1, 0.75, 0.5, 0.4, 0.33, 0.25, 0.2, 1.5];
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, os.availableParallelism?.() ?? 4));
 
 async function main() {
-  const { outputJson, concurrency, inputPath } = await parseCliArgs(Bun.argv.slice(2));
+  const { outputJson, concurrency, inputPath, scanMode } = await parseCliArgs(Bun.argv.slice(2));
   if (!inputPath) {
     console.error("No folder provided.");
     process.exit(1);
@@ -45,6 +47,7 @@ async function main() {
   logger.log(`Working directory: ${process.cwd()}`);
   logger.log(`Target: ${target}`);
   logger.log(`Concurrency: ${concurrency}`);
+  logger.log(`Scan mode: ${scanMode}`);
   logger.log("");
 
   const files = stat.isDirectory() ? await collectTiffFiles(target) : [target];
@@ -58,20 +61,32 @@ async function main() {
   }
 
   const results = new Array<ScanResult>(tiffFiles.length);
+  const fileDurationsMs = new Array<number>(tiffFiles.length);
   const progress = outputJson ? null : createProgressTracker(tiffFiles.length, concurrency);
-  await runWithConcurrency(tiffFiles, concurrency, async (filePath, index) => {
-    progress?.startFile(index + 1, filePath);
 
-    const result = await scanTiff(filePath, (completedSteps, totalSteps) => {
+  const callbacks = {
+    onStart(filePath: string, index: number) {
+      progress?.startFile(index + 1, filePath);
+    },
+    onProgress(filePath: string, completedSteps: number, totalSteps: number) {
       progress?.updateFile(filePath, completedSteps, totalSteps);
-    });
-    results[index] = result;
+    },
+    onResult(filePath: string, index: number, result: ScanResult) {
+      results[index] = result;
+      progress?.finishFile(filePath, result);
+      logResult(logger, result);
+      if (result.hasQrCode && !result.error) {
+        logResult(qrLogger, result);
+      }
+    },
+  };
 
-    progress?.finishFile(filePath, result);
-    logResult(logger, result);
-    if (result.hasQrCode && !result.error) {
-      logResult(qrLogger, result);
-    }
+  const poolStats = await runWithWorkerPool(tiffFiles, concurrency, scanMode, {
+    ...callbacks,
+    onResult(filePath, index, result, durationMs) {
+      fileDurationsMs[index] = durationMs;
+      callbacks.onResult(filePath, index, result);
+    },
   });
   progress?.stop();
 
@@ -82,7 +97,7 @@ async function main() {
     return;
   }
 
-  printResults(results, logger);
+  printResults(results, logger, buildTimingSummary(poolStats, fileDurationsMs));
   await logger.flush();
   const qrLogPath = await flushQrLoggerIfNeeded(qrLogger);
   console.log(`Log file: ${logger.path}`);
@@ -94,11 +109,17 @@ async function main() {
 async function parseCliArgs(args: string[]) {
   const outputJson = args.includes("--json");
   let concurrency = DEFAULT_CONCURRENCY;
+  let scanMode: ScanMode = "default";
   const positionalArgs: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--json") {
+      continue;
+    }
+
+    if (arg === "--aggressive") {
+      scanMode = "aggressive";
       continue;
     }
 
@@ -122,6 +143,7 @@ async function parseCliArgs(args: string[]) {
   return {
     outputJson,
     concurrency,
+    scanMode,
     inputPath: positionalArgs[0] ?? (await promptForFolder()),
   };
 }
@@ -194,172 +216,142 @@ function isTiff(filePath: string) {
   return [...TIFF_EXTENSIONS].some((ext) => lower.endsWith(ext));
 }
 
-async function scanTiff(
-  filePath: string,
-  onProgress?: (completedSteps: number, totalSteps: number) => void,
-): Promise<ScanResult> {
-  try {
-    const buffer = await Bun.file(filePath).arrayBuffer();
-    const ifds = UTIF.decode(buffer);
-    const pageMatches: number[] = [];
-    const decodedValues = new Set<string>();
-    const totalStepsPerPage = buildRegions(100, 100).length * QR_SCALES.length;
-    const totalSteps = Math.max(1, ifds.length * totalStepsPerPage);
-    let completedSteps = 0;
-
-    for (let index = 0; index < ifds.length; index += 1) {
-      const ifd = ifds[index];
-      UTIF.decodeImage(buffer, ifd);
-      const rgba = UTIF.toRGBA8(ifd);
-
-      const pageValues = await detectQRCodes(rgba, ifd.width, ifd.height, async () => {
-        completedSteps += 1;
-        onProgress?.(completedSteps, totalSteps);
-        if (completedSteps % 3 === 0) {
-          await Bun.sleep(0);
-        }
-      });
-      if (pageValues.length > 0) {
-        pageMatches.push(index + 1);
-        for (const value of pageValues) {
-          decodedValues.add(value);
-        }
-      }
-    }
-
-    return {
-      filePath,
-      hasQrCode: pageMatches.length > 0,
-      pageMatches,
-      decodedValues: [...decodedValues],
-    };
-  } catch (error) {
-    return {
-      filePath,
-      hasQrCode: false,
-      pageMatches: [],
-      decodedValues: [],
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-async function detectQRCodes(
-  rgba: Uint8Array,
-  width: number,
-  height: number,
-  onStep?: () => Promise<void>,
-): Promise<string[]> {
-  const found = new Set<string>();
-  const regions = buildRegions(width, height);
-
-  for (const region of regions) {
-    const cropped = cropRgba(rgba, width, region.x, region.y, region.width, region.height);
-
-    for (const scale of QR_SCALES) {
-      const scaledWidth = Math.max(32, Math.round(region.width * scale));
-      const scaledHeight = Math.max(32, Math.round(region.height * scale));
-      const candidate =
-        scale === 1
-          ? cropped
-          : resizeNearest(cropped, region.width, region.height, scaledWidth, scaledHeight);
-
-      const qr = jsQR(candidate, scaledWidth, scaledHeight, {
-        inversionAttempts: "attemptBoth",
-      });
-
-      if (qr?.data) {
-        found.add(qr.data);
-      }
-
-      await onStep?.();
-    }
-  }
-
-  return [...found];
-}
-
-async function runWithConcurrency<T>(
-  items: T[],
+async function runWithWorkerPool(
+  items: string[],
   concurrency: number,
-  handler: (item: T, index: number) => Promise<void>,
-) {
+  scanMode: ScanMode,
+  callbacks: {
+    onStart: (filePath: string, index: number) => void;
+    onProgress: (filePath: string, completedSteps: number, totalSteps: number) => void;
+    onResult: (filePath: string, index: number, result: ScanResult, durationMs: number) => void;
+  },
+): Promise<PoolStats> {
   let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      await handler(items[currentIndex], currentIndex);
-    }
-  }
-
   const workerCount = Math.min(concurrency, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-}
-
-function buildRegions(width: number, height: number) {
-  const topThird = Math.max(32, Math.floor(height * 0.35));
-  const topHalf = Math.max(32, Math.floor(height * 0.45));
-  const leftHalf = Math.floor(width / 2);
-  const rightHalf = width - leftHalf;
-  const leftWide = Math.max(32, Math.floor(width * 0.6));
-  const rightWideX = Math.floor(width * 0.4);
-  const rightWide = width - rightWideX;
-
-  return [
-    { x: 0, y: 0, width, height },
-    { x: 0, y: 0, width, height: topThird },
-    { x: 0, y: 0, width: leftHalf, height: topThird },
-    { x: leftHalf, y: 0, width: rightHalf, height: topThird },
-    { x: 0, y: 0, width: leftWide, height: topHalf },
-    { x: rightWideX, y: 0, width: rightWide, height: topHalf },
-  ];
-}
-
-function cropRgba(
-  rgba: Uint8Array,
-  sourceWidth: number,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-) {
-  const out = new Uint8ClampedArray(width * height * 4);
-
-  for (let row = 0; row < height; row += 1) {
-    const sourceStart = ((y + row) * sourceWidth + x) * 4;
-    const targetStart = row * width * 4;
-    out.set(rgba.subarray(sourceStart, sourceStart + width * 4), targetStart);
+  if (workerCount === 0) {
+    return {
+      totalWallTimeMs: 0,
+      fileTimeMs: [],
+      workerStats: [],
+    };
   }
 
-  return out;
-}
+  const assignments = new Map<string, number>();
+  const startedAtByFile = new Map<string, number>();
+  const workerStats = Array.from({ length: workerCount }, (_, index) => ({
+    workerId: index + 1,
+    filesCompleted: 0,
+    activeTimeMs: 0,
+  }));
+  const fileTimeMs: number[] = [];
+  let completed = 0;
+  const poolStartedAt = performance.now();
 
-function resizeNearest(
-  rgba: Uint8ClampedArray,
-  sourceWidth: number,
-  sourceHeight: number,
-  width: number,
-  height: number,
-) {
-  const out = new Uint8ClampedArray(width * height * 4);
+  await new Promise<void>((resolve, reject) => {
+    const workers = Array.from(
+      { length: workerCount },
+      (_, index) => ({
+        instance: new Worker(new URL("./scan-worker.ts", import.meta.url).href),
+        stats: workerStats[index],
+      }),
+    );
 
-  for (let y = 0; y < height; y += 1) {
-    const sourceY = Math.min(sourceHeight - 1, Math.floor((y * sourceHeight) / height));
-    for (let x = 0; x < width; x += 1) {
-      const sourceX = Math.min(sourceWidth - 1, Math.floor((x * sourceWidth) / width));
-      const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
-      const targetIndex = (y * width + x) * 4;
+    const cleanup = async () => {
+      await Promise.allSettled(
+        workers.map(async ({ instance }) => {
+          const worker = instance;
+          worker.postMessage({ type: "stop" });
+          await worker.terminate();
+        }),
+      );
+    };
 
-      out[targetIndex] = rgba[sourceIndex];
-      out[targetIndex + 1] = rgba[sourceIndex + 1];
-      out[targetIndex + 2] = rgba[sourceIndex + 2];
-      out[targetIndex + 3] = rgba[sourceIndex + 3];
+    const dispatchNext = (worker: Worker) => {
+      const currentIndex = nextIndex;
+      if (currentIndex >= items.length) {
+        return false;
+      }
+
+      nextIndex += 1;
+      const filePath = items[currentIndex];
+      assignments.set(filePath, currentIndex);
+      startedAtByFile.set(filePath, performance.now());
+      callbacks.onStart(filePath, currentIndex);
+      worker.postMessage({
+        type: "scan",
+        filePath,
+        mode: scanMode,
+      });
+      return true;
+    };
+
+    const handleFailure = async (error: unknown) => {
+      await cleanup();
+      reject(error);
+    };
+
+    for (const { instance, stats } of workers) {
+      const worker = instance;
+      worker.addEventListener("message", (event) => {
+        const message = event.data;
+        if (!message || typeof message !== "object" || !("type" in message)) {
+          return;
+        }
+
+        if (message.type === "progress") {
+          callbacks.onProgress(message.filePath, message.completedSteps, message.totalSteps);
+          return;
+        }
+
+        if (message.type === "error") {
+          void handleFailure(new Error(`Worker scan failed for ${message.filePath}: ${message.error}`));
+          return;
+        }
+
+        if (message.type !== "result") {
+          return;
+        }
+
+        const index = assignments.get(message.result.filePath);
+        if (index === undefined) {
+          return;
+        }
+
+        assignments.delete(message.result.filePath);
+        const startedAt = startedAtByFile.get(message.result.filePath) ?? performance.now();
+        startedAtByFile.delete(message.result.filePath);
+        const durationMs = performance.now() - startedAt;
+        fileTimeMs.push(durationMs);
+        stats.filesCompleted += 1;
+        stats.activeTimeMs += durationMs;
+        callbacks.onResult(message.result.filePath, index, message.result, durationMs);
+        completed += 1;
+
+        if (completed >= items.length) {
+          void cleanup().then(resolve, reject);
+          return;
+        }
+
+        dispatchNext(worker);
+      });
+
+      worker.addEventListener("error", (event) => {
+        void handleFailure(event.error ?? new Error(event.message));
+      });
     }
-  }
 
-  return out;
+    for (const { instance } of workers) {
+      if (!dispatchNext(instance)) {
+        break;
+      }
+    }
+  });
+
+  return {
+    totalWallTimeMs: performance.now() - poolStartedAt,
+    fileTimeMs,
+    workerStats,
+  };
 }
 
 function createProgressTracker(totalFiles: number, concurrency: number) {
@@ -457,9 +449,7 @@ function createProgressTracker(totalFiles: number, concurrency: number) {
 
       completedFiles += 1;
       activeFiles.delete(filePath);
-      const status = result.error
-        ? `error: ${result.error}`
-        : `found ${result.decodedValues.length} QR code(s)`;
+      const status = result.error ? `error: ${result.error}` : result.hasQrCode ? "QR YES" : "QR NO";
       const fileDuration = ((Date.now() - entry.startedAt) / 1000).toFixed(1);
       process.stdout.write(
         `\x1b[2K\r[${entry.index}/${totalFiles}] ${basename(filePath)} -> ${status} in ${fileDuration}s\n`,
@@ -491,7 +481,7 @@ function truncateMiddle(value: string, maxLength: number) {
   return `${value.slice(0, leftLength)}...${value.slice(value.length - rightLength)}`;
 }
 
-function printResults(results: ScanResult[], logger: Logger) {
+function printResults(results: ScanResult[], logger: Logger, timingSummary: string[]) {
   let matches = 0;
   let failures = 0;
 
@@ -509,10 +499,6 @@ function printResults(results: ScanResult[], logger: Logger) {
     if (result.hasQrCode) {
       matches += 1;
       console.log(`QR YES ${result.filePath}`);
-      console.log(`  Pages: ${result.pageMatches.join(", ")}`);
-      if (result.decodedValues.length > 0) {
-        console.log(`  Values: ${result.decodedValues.join(" | ")}`);
-      }
       continue;
     }
 
@@ -524,12 +510,18 @@ function printResults(results: ScanResult[], logger: Logger) {
   console.log(`With QR: ${matches}`);
   console.log(`Without QR: ${results.length - matches - failures}`);
   console.log(`Errors: ${failures}`);
+  for (const line of timingSummary) {
+    console.log(line);
+  }
 
   logger.log("");
   logger.log(`Scanned: ${results.length}`);
   logger.log(`With QR: ${matches}`);
   logger.log(`Without QR: ${results.length - matches - failures}`);
   logger.log(`Errors: ${failures}`);
+  for (const line of timingSummary) {
+    logger.log(line);
+  }
 }
 
 function createLogger(rootDir: string, fileName: string): Logger {
@@ -569,10 +561,6 @@ function logResult(logger: Logger, result: ScanResult) {
 
   if (result.hasQrCode) {
     logger.log(`QR YES ${result.filePath}`);
-    logger.log(`  Pages: ${result.pageMatches.join(", ")}`);
-    if (result.decodedValues.length > 0) {
-      logger.log(`  Values: ${result.decodedValues.join(" | ")}`);
-    }
     return;
   }
 
@@ -586,6 +574,39 @@ async function flushQrLoggerIfNeeded(logger: Logger) {
   }
 
   return null;
+}
+
+function buildTimingSummary(poolStats: PoolStats, fileDurationsMs: number[]) {
+  const durations = fileDurationsMs.filter((value) => Number.isFinite(value));
+  const totalFileTimeMs = durations.reduce((sum, value) => sum + value, 0);
+  const averageFileTimeMs = durations.length > 0 ? totalFileTimeMs / durations.length : 0;
+  const sortedDurations = [...durations].sort((left, right) => left - right);
+  const medianFileTimeMs =
+    sortedDurations.length === 0
+      ? 0
+      : sortedDurations[Math.floor(sortedDurations.length / 2)];
+
+  return [
+    `Total time: ${formatDuration(poolStats.totalWallTimeMs)}`,
+    `Average file time: ${formatDuration(averageFileTimeMs)}`,
+    `Median file time: ${formatDuration(medianFileTimeMs)}`,
+    `Combined file time: ${formatDuration(totalFileTimeMs)}`,
+    ...poolStats.workerStats.map(
+      (stats) =>
+        `Worker ${stats.workerId}: ${stats.filesCompleted} file(s), active ${formatDuration(stats.activeTimeMs)}`,
+    ),
+  ];
+}
+
+function formatDuration(durationMs: number) {
+  const totalSeconds = durationMs / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds - minutes * 60;
+  return `${minutes}m ${seconds.toFixed(1)}s`;
 }
 
 await main();
