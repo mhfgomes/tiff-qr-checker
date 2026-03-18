@@ -1,6 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import readline from "node:readline";
 import { scanTiff, type ScanMode, type ScanResult } from "./scan-core";
 import packageJson from "../package.json" with { type: "json" };
 
@@ -9,6 +10,11 @@ type Logger = {
   log: (line: string) => void;
   hasContent: () => boolean;
   flush: () => Promise<void>;
+};
+
+type ScanItem = {
+  filePath: string;
+  skipped: boolean;
 };
 
 type WorkerStats = {
@@ -23,33 +29,73 @@ type PoolStats = {
   workerStats: WorkerStats[];
 };
 
+type WorkerRequestMessage = {
+  type: "scan";
+  id: string;
+  filePath: string;
+  mode: ScanMode;
+};
+
+type WorkerStopMessage = {
+  type: "stop";
+};
+
+type WorkerMessage = WorkerRequestMessage | WorkerStopMessage;
+
+type WorkerProgressMessage = {
+  type: "progress";
+  id: string;
+  filePath: string;
+  completedSteps: number;
+  totalSteps: number;
+};
+
+type WorkerResultMessage = {
+  type: "result";
+  id: string;
+  result: ScanResult;
+  durationMs: number;
+};
+
+type WorkerErrorMessage = {
+  type: "error";
+  id: string;
+  filePath: string;
+  error: string;
+};
+
+type WorkerResponseMessage = WorkerProgressMessage | WorkerResultMessage | WorkerErrorMessage;
+
 const TIFF_EXTENSIONS = new Set([".tif", ".tiff"]);
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, os.availableParallelism?.() ?? 4));
+const PROGRESS_RENDER_INTERVAL_MS = 80;
+const WORKER_PROGRESS_STEP_INTERVAL = 3;
+const WORKER_PROGRESS_TIME_INTERVAL_MS = 100;
 
 async function main() {
   const {
     outputJson,
     concurrency,
     inputPath,
+    maxSizeBytes,
     scanMode,
     showVersion,
-    internalScanFile,
-  } = await parseCliArgs(Bun.argv.slice(2));
+    showHelp,
+    internalWorker,
+  } = await parseCliArgs(process.argv.slice(2));
   if (showVersion) {
     console.log(packageJson.version);
     return;
   }
 
-  if (internalScanFile) {
-    const startedAt = performance.now();
-    const result = await scanTiff(internalScanFile, scanMode);
-    console.log(
-      JSON.stringify({
-        result,
-        durationMs: performance.now() - startedAt,
-      }),
-    );
+  if (showHelp) {
+    printHelp();
+    return;
+  }
+
+  if (internalWorker) {
+    await runInternalWorkerLoop();
     return;
   }
 
@@ -74,21 +120,47 @@ async function main() {
   logger.log(`Target: ${target}`);
   logger.log(`Concurrency: ${concurrency}`);
   logger.log(`Scan mode: ${scanMode}`);
+  if (maxSizeBytes !== null) {
+    logger.log(`Max size: ${formatFileSize(maxSizeBytes)}`);
+  }
   logger.log("");
 
-  const files = stat.isDirectory() ? await collectTiffFiles(target) : [target];
-  const tiffFiles = files.filter((filePath) => isTiff(filePath));
+  const files = stat.isDirectory() ? await collectTiffFiles(target, maxSizeBytes) : [target];
+  const scanItems =
+    stat.isDirectory()
+      ? files
+      : await buildScanItems([target], maxSizeBytes);
 
-  if (tiffFiles.length === 0) {
-    logger.log("No .tif or .tiff files found.");
+  if (scanItems.length === 0) {
+    const message =
+      maxSizeBytes === null
+        ? "No .tif or .tiff files found."
+        : `No .tif or .tiff files found at or below ${formatFileSize(maxSizeBytes)}.`;
+    logger.log(message);
     await logger.flush();
-    console.log(outputJson ? "[]" : "No .tif or .tiff files found.");
+    console.log(outputJson ? "[]" : message);
     return;
   }
 
-  const results = new Array<ScanResult>(tiffFiles.length);
-  const fileDurationsMs = new Array<number>(tiffFiles.length);
-  const progress = outputJson ? null : createProgressTracker(tiffFiles.length, concurrency);
+  const results = new Array<ScanResult>(scanItems.length);
+  const fileDurationsMs = new Array<number>(scanItems.length);
+  const progress = outputJson ? null : createProgressTracker(scanItems.length, concurrency);
+
+  for (let index = 0; index < scanItems.length; index += 1) {
+    const item = scanItems[index];
+    if (!item.skipped) {
+      continue;
+    }
+
+    const skippedResult: ScanResult = {
+      filePath: item.filePath,
+      hasQrCode: false,
+      error: "SKIPPED",
+    };
+    results[index] = skippedResult;
+    fileDurationsMs[index] = 0;
+    logResult(logger, skippedResult);
+  }
 
   const callbacks = {
     onStart(filePath: string, index: number) {
@@ -107,7 +179,11 @@ async function main() {
     },
   };
 
-  const poolStats = await runWithWorkerPool(tiffFiles, concurrency, scanMode, {
+  const filesToScan = scanItems
+    .map((item, index) => ({ ...item, index }))
+    .filter((item) => !item.skipped);
+
+  const poolStats = await runWithWorkerPool(filesToScan, concurrency, scanMode, {
     ...callbacks,
     onResult(filePath, index, result, durationMs) {
       fileDurationsMs[index] = durationMs;
@@ -135,9 +211,11 @@ async function main() {
 async function parseCliArgs(args: string[]) {
   const outputJson = args.includes("--json");
   let concurrency = DEFAULT_CONCURRENCY;
+  let maxSizeBytes: number | null = null;
   let scanMode: ScanMode = "default";
   let showVersion = false;
-  let internalScanFile: string | null = null;
+  let showHelp = false;
+  let internalWorker = false;
   const positionalArgs: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -151,18 +229,13 @@ async function parseCliArgs(args: string[]) {
       continue;
     }
 
-    if (arg === "--internal-scan-file") {
-      internalScanFile = args[index + 1] ?? null;
-      index += 1;
+    if (arg === "--help" || arg === "-h") {
+      showHelp = true;
       continue;
     }
 
-    if (arg === "--internal-scan-mode") {
-      const value = args[index + 1];
-      if (value === "aggressive" || value === "default") {
-        scanMode = value;
-      }
-      index += 1;
+    if (arg === "--internal-worker") {
+      internalWorker = true;
       continue;
     }
 
@@ -185,19 +258,56 @@ async function parseCliArgs(args: string[]) {
       continue;
     }
 
+    if (arg === "--max-size" || arg === "-m") {
+      const nextValue = args[index + 1];
+      if (nextValue) {
+        maxSizeBytes = normalizeMaxSize(nextValue);
+        index += 1;
+      }
+      continue;
+    }
+
+    if (arg.startsWith("--max-size=")) {
+      maxSizeBytes = normalizeMaxSize(arg.slice("--max-size=".length));
+      continue;
+    }
+
     positionalArgs.push(arg);
   }
 
-  const inputPath = showVersion ? null : positionalArgs[0] ?? (await promptForFolder());
+  const inputPath =
+    showVersion || showHelp || internalWorker ? null : positionalArgs[0] ?? (await promptForFolder());
 
   return {
     outputJson,
     concurrency,
+    maxSizeBytes,
     scanMode,
     showVersion,
-    internalScanFile,
+    showHelp,
+    internalWorker,
     inputPath,
   };
+}
+
+function printHelp() {
+  console.log(`TIFF QR Checker ${packageJson.version}
+
+Usage:
+  bun run src/cli.ts [folder] [options]
+  tiff-qr-checker-win.exe [folder] [options]
+
+Options:
+  -c, --concurrency <n>  Number of worker processes to use
+  -m, --max-size <kb>    Skip TIFFs larger than this size in KB
+      --aggressive       Use slower fallback scan stages for harder files
+      --json             Print JSON output instead of terminal text
+  -v, --version          Show current version
+  -h, --help             Show this help
+
+Notes:
+  If no folder is provided, the tool prompts for one.
+  Files skipped by --max-size still count toward the total and are shown as SKIPPED.`);
 }
 
 function normalizeConcurrency(value: string) {
@@ -207,6 +317,15 @@ function normalizeConcurrency(value: string) {
   }
 
   return Math.max(1, Math.min(32, parsed));
+}
+
+function normalizeMaxSize(value: string) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+
+  return Math.floor(parsed * 1024);
 }
 
 async function promptForFolder(): Promise<string | null> {
@@ -228,7 +347,7 @@ async function safeStat(targetPath: string) {
   }
 }
 
-async function collectTiffFiles(rootDir: string): Promise<string[]> {
+async function collectTiffFiles(rootDir: string, maxSizeBytes: number | null): Promise<ScanItem[]> {
   const found: string[] = [];
   const queue = [rootDir];
 
@@ -260,7 +379,7 @@ async function collectTiffFiles(rootDir: string): Promise<string[]> {
   }
 
   found.sort((a, b) => a.localeCompare(b));
-  return found;
+  return buildScanItems(found, maxSizeBytes);
 }
 
 function isTiff(filePath: string) {
@@ -268,8 +387,32 @@ function isTiff(filePath: string) {
   return [...TIFF_EXTENSIONS].some((ext) => lower.endsWith(ext));
 }
 
+async function buildScanItems(filePaths: string[], maxSizeBytes: number | null) {
+  const items: ScanItem[] = [];
+
+  for (const filePath of filePaths) {
+    if (!isTiff(filePath)) {
+      continue;
+    }
+
+    const stat = await safeStat(filePath);
+    if (stat) {
+      items.push({
+        filePath,
+        skipped: !matchesMaxSize(stat.size, maxSizeBytes),
+      });
+    }
+  }
+
+  return items;
+}
+
+function matchesMaxSize(sizeBytes: number, maxSizeBytes: number | null) {
+  return maxSizeBytes === null || sizeBytes <= maxSizeBytes;
+}
+
 async function runWithWorkerPool(
-  items: string[],
+  items: Array<{ filePath: string; index: number }>,
   concurrency: number,
   scanMode: ScanMode,
   callbacks: {
@@ -301,30 +444,34 @@ async function runWithWorkerPool(
   const spawnSpec = getWorkerSpawnSpec();
 
   await new Promise<void>((resolve, reject) => {
-    const workers = Array.from(
-      { length: workerCount },
-      (_, index) => ({
-        workerId: index + 1,
-        busy: false,
-        stats: workerStats[index],
-      }),
+    let workers: ReturnType<typeof createPersistentWorker>[] = [];
+
+    const cleanup = async () => {
+      await Promise.allSettled(workers.map((worker) => worker.close()));
+    };
+
+    const handleFailure = async (error: unknown) => {
+      await cleanup();
+      reject(error);
+    };
+
+    workers = Array.from({ length: workerCount }, (_, index) =>
+      createPersistentWorker(spawnSpec, index + 1, workerStats[index], callbacks.onProgress, handleFailure),
     );
 
-    const cleanup = async () => {};
-
-    const dispatchNext = (worker: (typeof workers)[number]) => {
+    const dispatchNext = (worker: ReturnType<typeof createPersistentWorker>) => {
       const currentIndex = nextIndex;
       if (currentIndex >= items.length) {
         return false;
       }
 
       nextIndex += 1;
-      const filePath = items[currentIndex];
-      assignments.set(filePath, currentIndex);
+      const { filePath, index } = items[currentIndex];
+      assignments.set(filePath, index);
       startedAtByFile.set(filePath, performance.now());
-      worker.busy = true;
-      callbacks.onStart(filePath, currentIndex);
-      runWorkerChild(spawnSpec, filePath, scanMode)
+      callbacks.onStart(filePath, index);
+      worker
+        .run(filePath, scanMode)
         .then(({ result, durationMs }) => {
           const index = assignments.get(result.filePath);
           if (index === undefined) {
@@ -334,9 +481,6 @@ async function runWithWorkerPool(
           assignments.delete(result.filePath);
           startedAtByFile.delete(result.filePath);
           fileTimeMs.push(durationMs);
-          worker.stats.filesCompleted += 1;
-          worker.stats.activeTimeMs += durationMs;
-          worker.busy = false;
           callbacks.onResult(result.filePath, index, result, durationMs);
           completed += 1;
 
@@ -351,11 +495,6 @@ async function runWithWorkerPool(
           void handleFailure(error);
         });
       return true;
-    };
-
-    const handleFailure = async (error: unknown) => {
-      await cleanup();
-      reject(error);
     };
 
     for (const worker of workers) {
@@ -374,7 +513,7 @@ async function runWithWorkerPool(
 
 function getWorkerSpawnSpec() {
   const execPath = process.execPath;
-  const scriptPath = Bun.argv[1];
+  const scriptPath = process.argv[1];
   const isScriptRun =
     typeof scriptPath === "string" &&
     scriptPath.length > 0 &&
@@ -383,76 +522,149 @@ function getWorkerSpawnSpec() {
   if (isScriptRun) {
     return {
       command: execPath,
-      baseArgs: [scriptPath],
+      baseArgs: [scriptPath, "--internal-worker"],
     };
   }
 
   return {
     command: execPath,
-    baseArgs: [],
+    baseArgs: ["--internal-worker"],
   };
 }
 
-function runWorkerChild(
+function createPersistentWorker(
   spawnSpec: { command: string; baseArgs: string[] },
-  filePath: string,
-  scanMode: ScanMode,
+  workerId: number,
+  stats: WorkerStats,
+  onProgress: (filePath: string, completedSteps: number, totalSteps: number) => void,
+  onFailure: (error: unknown) => void,
 ) {
-  return new Promise<{ result: ScanResult; durationMs: number }>((resolve, reject) => {
-    const child = spawn(
-      spawnSpec.command,
-      [
-        ...spawnSpec.baseArgs,
-        "--internal-scan-file",
-        filePath,
-        "--internal-scan-mode",
-        scanMode,
-      ],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      },
+  const child = spawn(spawnSpec.command, spawnSpec.baseArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const stdoutReader = readline.createInterface({
+    input: child.stdout,
+    crlfDelay: Infinity,
+  });
+  const pending = new Map<
+    string,
+    {
+      filePath: string;
+      resolve: (value: { result: ScanResult; durationMs: number }) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  let stderr = "";
+
+  const rejectAll = (error: Error) => {
+    for (const request of pending.values()) {
+      request.reject(error);
+    }
+    pending.clear();
+  };
+
+  stdoutReader.on("line", (line) => {
+    if (!line.trim()) {
+      return;
+    }
+
+    let message: WorkerResponseMessage;
+    try {
+      message = JSON.parse(line) as WorkerResponseMessage;
+    } catch (error) {
+      rejectAll(
+        new Error(
+          `Worker ${workerId} produced invalid output: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+      return;
+    }
+
+    if (message.type === "progress") {
+      onProgress(message.filePath, message.completedSteps, message.totalSteps);
+      return;
+    }
+
+    const request = pending.get(message.id);
+    if (!request) {
+      return;
+    }
+
+    if (message.type === "error") {
+      pending.delete(message.id);
+      request.reject(new Error(`Worker ${workerId} scan failed for ${request.filePath}: ${message.error}`));
+      return;
+    }
+
+    pending.delete(message.id);
+    stats.filesCompleted += 1;
+    stats.activeTimeMs += message.durationMs;
+    request.resolve({
+      result: message.result,
+      durationMs: message.durationMs,
+    });
+  });
+
+  child.stderr.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+
+  child.on("error", (error) => {
+    rejectAll(error instanceof Error ? error : new Error(String(error)));
+    onFailure(error);
+  });
+
+  child.on("close", (code) => {
+    if (pending.size === 0 && code === 0) {
+      return;
+    }
+
+    const error = new Error(
+      `Worker ${workerId} stopped unexpectedly: ${stderr.trim() || `exit code ${code ?? "unknown"}`}`,
     );
+    rejectAll(error);
+    if (pending.size > 0 || code !== 0) {
+      onFailure(error);
+    }
+  });
 
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-
-    child.on("error", (error) => {
-      reject(error);
-    });
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(
-            `Worker scan failed for ${filePath}: ${stderr.trim() || `exit code ${code ?? "unknown"}`}`,
-          ),
-        );
+  return {
+    run(filePath: string, mode: ScanMode) {
+      return new Promise<{ result: ScanResult; durationMs: number }>((resolve, reject) => {
+        const id = `${workerId}-${stats.filesCompleted + pending.size + 1}-${Date.now()}`;
+        pending.set(id, {
+          filePath,
+          resolve,
+          reject,
+        });
+        const payload: WorkerRequestMessage = {
+          type: "scan",
+          id,
+          filePath,
+          mode,
+        };
+        child.stdin.write(`${JSON.stringify(payload)}\n`);
+      });
+    },
+    async close() {
+      if (child.killed) {
         return;
       }
 
       try {
-        const parsed = JSON.parse(stdout.trim()) as { result: ScanResult; durationMs: number };
-        resolve(parsed);
-      } catch (error) {
-        reject(
-          new Error(
-            `Worker scan produced invalid output for ${filePath}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          ),
-        );
-      }
-    });
-  });
+        const payload: WorkerStopMessage = { type: "stop" };
+        child.stdin.write(`${JSON.stringify(payload)}\n`);
+        child.stdin.end();
+      } catch {}
+
+      await new Promise<void>((resolve) => {
+        child.once("close", () => resolve());
+      });
+    },
+  };
 }
 
 function createProgressTracker(totalFiles: number, concurrency: number) {
@@ -469,8 +681,15 @@ function createProgressTracker(totalFiles: number, concurrency: number) {
   let completedFiles = 0;
   let frame = 0;
   const startTime = Date.now();
+  let lastRenderAt = 0;
 
-  const render = () => {
+  const render = (force = false) => {
+    const now = Date.now();
+    if (!force && now - lastRenderAt < PROGRESS_RENDER_INTERVAL_MS) {
+      return;
+    }
+
+    lastRenderAt = now;
     const terminalWidth = process.stdout.columns ?? 100;
     const barWidth = 24;
     let activeProgress = 0;
@@ -530,7 +749,7 @@ function createProgressTracker(totalFiles: number, concurrency: number) {
         totalSteps: 1,
         startedAt: Date.now(),
       });
-      render();
+      render(true);
     },
     updateFile(filePath: string, nextStep: number, nextTotalSteps: number) {
       const entry = activeFiles.get(filePath);
@@ -555,11 +774,91 @@ function createProgressTracker(totalFiles: number, concurrency: number) {
       process.stdout.write(
         `\x1b[2K\r[${entry.index}/${totalFiles}] ${basename(filePath)} -> ${status} in ${fileDuration}s\n`,
       );
+      render(true);
     },
     stop() {
+      render(true);
       process.stdout.write("\x1b[2K\r");
     },
   };
+}
+
+async function runInternalWorkerLoop() {
+  const input = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of input) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    let message: WorkerMessage;
+    try {
+      message = JSON.parse(line) as WorkerMessage;
+    } catch (error) {
+      console.log(
+        JSON.stringify({
+          type: "error",
+          id: "unknown",
+          filePath: "",
+          error: `Invalid worker message: ${error instanceof Error ? error.message : String(error)}`,
+        } satisfies WorkerErrorMessage),
+      );
+      continue;
+    }
+
+    if (message.type === "stop") {
+      break;
+    }
+
+    const startedAt = performance.now();
+    let lastProgressStep = 0;
+    let lastProgressSentAt = 0;
+
+    try {
+      const result = await scanTiff(message.filePath, message.mode, (completedSteps, totalSteps) => {
+        const now = Date.now();
+        const shouldSend =
+          completedSteps === 1 ||
+          completedSteps === totalSteps ||
+          completedSteps - lastProgressStep >= WORKER_PROGRESS_STEP_INTERVAL ||
+          now - lastProgressSentAt >= WORKER_PROGRESS_TIME_INTERVAL_MS;
+
+        if (!shouldSend) {
+          return;
+        }
+
+        lastProgressStep = completedSteps;
+        lastProgressSentAt = now;
+        const payload: WorkerProgressMessage = {
+          type: "progress",
+          id: message.id,
+          filePath: message.filePath,
+          completedSteps,
+          totalSteps,
+        };
+        process.stdout.write(`${JSON.stringify(payload)}\n`);
+      });
+
+      const payload: WorkerResultMessage = {
+        type: "result",
+        id: message.id,
+        result,
+        durationMs: performance.now() - startedAt,
+      };
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+    } catch (error) {
+      const payload: WorkerErrorMessage = {
+        type: "error",
+        id: message.id,
+        filePath: message.filePath,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
+    }
+  }
 }
 
 function basename(filePath: string) {
@@ -585,11 +884,18 @@ function truncateMiddle(value: string, maxLength: number) {
 function printResults(results: ScanResult[], logger: Logger, timingSummary: string[]) {
   let matches = 0;
   let failures = 0;
+  let skipped = 0;
 
   logger.log("");
   logger.log("Results:");
 
   for (const result of results) {
+    if (result.error === "SKIPPED") {
+      skipped += 1;
+      console.log(`SKIPPED ${result.filePath}`);
+      continue;
+    }
+
     if (result.error) {
       failures += 1;
       console.log(`ERROR ${result.filePath}`);
@@ -609,7 +915,8 @@ function printResults(results: ScanResult[], logger: Logger, timingSummary: stri
   console.log("");
   console.log(`Scanned: ${results.length}`);
   console.log(`With QR: ${matches}`);
-  console.log(`Without QR: ${results.length - matches - failures}`);
+  console.log(`Without QR: ${results.length - matches - failures - skipped}`);
+  console.log(`Skipped: ${skipped}`);
   console.log(`Errors: ${failures}`);
   for (const line of timingSummary) {
     console.log(line);
@@ -618,7 +925,8 @@ function printResults(results: ScanResult[], logger: Logger, timingSummary: stri
   logger.log("");
   logger.log(`Scanned: ${results.length}`);
   logger.log(`With QR: ${matches}`);
-  logger.log(`Without QR: ${results.length - matches - failures}`);
+  logger.log(`Without QR: ${results.length - matches - failures - skipped}`);
+  logger.log(`Skipped: ${skipped}`);
   logger.log(`Errors: ${failures}`);
   for (const line of timingSummary) {
     logger.log(line);
@@ -654,6 +962,11 @@ function formatTimestamp(date: Date) {
 }
 
 function logResult(logger: Logger, result: ScanResult) {
+  if (result.error === "SKIPPED") {
+    logger.log(`SKIPPED ${result.filePath}`);
+    return;
+  }
+
   if (result.error) {
     logger.log(`ERROR ${result.filePath}`);
     logger.log(`  ${result.error}`);
@@ -708,6 +1021,14 @@ function formatDuration(durationMs: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds - minutes * 60;
   return `${minutes}m ${seconds.toFixed(1)}s`;
+}
+
+function formatFileSize(sizeBytes: number) {
+  if (sizeBytes < 1024) {
+    return `${sizeBytes} B`;
+  }
+
+  return `${(sizeBytes / 1024).toFixed(0)} KB`;
 }
 
 await main();

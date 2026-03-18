@@ -9,7 +9,7 @@ export type ScanResult = {
 
 export type ScanMode = "default" | "aggressive";
 
-const DEFAULT_QR_SCALES = [1, 0.5];
+const DEFAULT_QR_SCALES = [1];
 const AGGRESSIVE_FALLBACK_QR_SCALES = [0.25, 0.75, 0.4, 0.33, 0.2, 1.5];
 
 export function estimateScanSteps(mode: ScanMode) {
@@ -100,7 +100,7 @@ async function detectQRCodes(
 
 function getScalePasses(mode: ScanMode) {
   if (mode === "aggressive") {
-    return [DEFAULT_QR_SCALES, AGGRESSIVE_FALLBACK_QR_SCALES];
+    return [[1, 0.5], AGGRESSIVE_FALLBACK_QR_SCALES];
   }
 
   return [DEFAULT_QR_SCALES];
