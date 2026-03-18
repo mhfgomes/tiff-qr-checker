@@ -60,7 +60,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/tiff-qr-checker.exe
+            dist/tiff-qr-checker-win.exe
             dist/tiff-qr-checker-linux
             dist/tiff-qr-checker-macos
           generate_release_notes: true

@@ -1,6 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import { type ScanMode, type ScanResult } from "./scan-core";
+import packageJson from "../package.json" with { type: "json" };
 
 type Logger = {
   path: string;
@@ -26,7 +27,14 @@ const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, os.availableParallelism?.() ?? 4));
 
 async function main() {
-  const { outputJson, concurrency, inputPath, scanMode } = await parseCliArgs(Bun.argv.slice(2));
+  const { outputJson, concurrency, inputPath, scanMode, showVersion } = await parseCliArgs(
+    Bun.argv.slice(2),
+  );
+  if (showVersion) {
+    console.log(packageJson.version);
+    return;
+  }
+
   if (!inputPath) {
     console.error("No folder provided.");
     process.exit(1);
@@ -110,11 +118,17 @@ async function parseCliArgs(args: string[]) {
   const outputJson = args.includes("--json");
   let concurrency = DEFAULT_CONCURRENCY;
   let scanMode: ScanMode = "default";
+  let showVersion = false;
   const positionalArgs: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--json") {
+      continue;
+    }
+
+    if (arg === "--version" || arg === "-v") {
+      showVersion = true;
       continue;
     }
 
@@ -140,11 +154,14 @@ async function parseCliArgs(args: string[]) {
     positionalArgs.push(arg);
   }
 
+  const inputPath = showVersion ? null : positionalArgs[0] ?? (await promptForFolder());
+
   return {
     outputJson,
     concurrency,
     scanMode,
-    inputPath: positionalArgs[0] ?? (await promptForFolder()),
+    showVersion,
+    inputPath,
   };
 }
 
