@@ -38,7 +38,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tiff-qr-checker-windows
-          path: dist/tiff-qr-checker.exe
+          path: dist/tiff-qr-checker-win.exe
           if-no-files-found: error
 
       - name: Upload Linux Artifact
