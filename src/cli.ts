@@ -1,6 +1,7 @@
 import path from "node:path";
 import os from "node:os";
-import { type ScanMode, type ScanResult } from "./scan-core";
+import { spawn } from "node:child_process";
+import { scanTiff, type ScanMode, type ScanResult } from "./scan-core";
 import packageJson from "../package.json" with { type: "json" };
 
 type Logger = {
@@ -27,11 +28,28 @@ const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, os.availableParallelism?.() ?? 4));
 
 async function main() {
-  const { outputJson, concurrency, inputPath, scanMode, showVersion } = await parseCliArgs(
-    Bun.argv.slice(2),
-  );
+  const {
+    outputJson,
+    concurrency,
+    inputPath,
+    scanMode,
+    showVersion,
+    internalScanFile,
+  } = await parseCliArgs(Bun.argv.slice(2));
   if (showVersion) {
     console.log(packageJson.version);
+    return;
+  }
+
+  if (internalScanFile) {
+    const startedAt = performance.now();
+    const result = await scanTiff(internalScanFile, scanMode);
+    console.log(
+      JSON.stringify({
+        result,
+        durationMs: performance.now() - startedAt,
+      }),
+    );
     return;
   }
 
@@ -119,6 +137,7 @@ async function parseCliArgs(args: string[]) {
   let concurrency = DEFAULT_CONCURRENCY;
   let scanMode: ScanMode = "default";
   let showVersion = false;
+  let internalScanFile: string | null = null;
   const positionalArgs: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -129,6 +148,21 @@ async function parseCliArgs(args: string[]) {
 
     if (arg === "--version" || arg === "-v") {
       showVersion = true;
+      continue;
+    }
+
+    if (arg === "--internal-scan-file") {
+      internalScanFile = args[index + 1] ?? null;
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--internal-scan-mode") {
+      const value = args[index + 1];
+      if (value === "aggressive" || value === "default") {
+        scanMode = value;
+      }
+      index += 1;
       continue;
     }
 
@@ -161,6 +195,7 @@ async function parseCliArgs(args: string[]) {
     concurrency,
     scanMode,
     showVersion,
+    internalScanFile,
     inputPath,
   };
 }
@@ -263,27 +298,21 @@ async function runWithWorkerPool(
   const fileTimeMs: number[] = [];
   let completed = 0;
   const poolStartedAt = performance.now();
+  const spawnSpec = getWorkerSpawnSpec();
 
   await new Promise<void>((resolve, reject) => {
     const workers = Array.from(
       { length: workerCount },
       (_, index) => ({
-        instance: new Worker(new URL("./scan-worker.ts", import.meta.url).href),
+        workerId: index + 1,
+        busy: false,
         stats: workerStats[index],
       }),
     );
 
-    const cleanup = async () => {
-      await Promise.allSettled(
-        workers.map(async ({ instance }) => {
-          const worker = instance;
-          worker.postMessage({ type: "stop" });
-          await worker.terminate();
-        }),
-      );
-    };
+    const cleanup = async () => {};
 
-    const dispatchNext = (worker: Worker) => {
+    const dispatchNext = (worker: (typeof workers)[number]) => {
       const currentIndex = nextIndex;
       if (currentIndex >= items.length) {
         return false;
@@ -293,12 +322,34 @@ async function runWithWorkerPool(
       const filePath = items[currentIndex];
       assignments.set(filePath, currentIndex);
       startedAtByFile.set(filePath, performance.now());
+      worker.busy = true;
       callbacks.onStart(filePath, currentIndex);
-      worker.postMessage({
-        type: "scan",
-        filePath,
-        mode: scanMode,
-      });
+      runWorkerChild(spawnSpec, filePath, scanMode)
+        .then(({ result, durationMs }) => {
+          const index = assignments.get(result.filePath);
+          if (index === undefined) {
+            return;
+          }
+
+          assignments.delete(result.filePath);
+          startedAtByFile.delete(result.filePath);
+          fileTimeMs.push(durationMs);
+          worker.stats.filesCompleted += 1;
+          worker.stats.activeTimeMs += durationMs;
+          worker.busy = false;
+          callbacks.onResult(result.filePath, index, result, durationMs);
+          completed += 1;
+
+          if (completed >= items.length) {
+            void cleanup().then(resolve, reject);
+            return;
+          }
+
+          dispatchNext(worker);
+        })
+        .catch((error) => {
+          void handleFailure(error);
+        });
       return true;
     };
 
@@ -307,58 +358,8 @@ async function runWithWorkerPool(
       reject(error);
     };
 
-    for (const { instance, stats } of workers) {
-      const worker = instance;
-      worker.addEventListener("message", (event) => {
-        const message = event.data;
-        if (!message || typeof message !== "object" || !("type" in message)) {
-          return;
-        }
-
-        if (message.type === "progress") {
-          callbacks.onProgress(message.filePath, message.completedSteps, message.totalSteps);
-          return;
-        }
-
-        if (message.type === "error") {
-          void handleFailure(new Error(`Worker scan failed for ${message.filePath}: ${message.error}`));
-          return;
-        }
-
-        if (message.type !== "result") {
-          return;
-        }
-
-        const index = assignments.get(message.result.filePath);
-        if (index === undefined) {
-          return;
-        }
-
-        assignments.delete(message.result.filePath);
-        const startedAt = startedAtByFile.get(message.result.filePath) ?? performance.now();
-        startedAtByFile.delete(message.result.filePath);
-        const durationMs = performance.now() - startedAt;
-        fileTimeMs.push(durationMs);
-        stats.filesCompleted += 1;
-        stats.activeTimeMs += durationMs;
-        callbacks.onResult(message.result.filePath, index, message.result, durationMs);
-        completed += 1;
-
-        if (completed >= items.length) {
-          void cleanup().then(resolve, reject);
-          return;
-        }
-
-        dispatchNext(worker);
-      });
-
-      worker.addEventListener("error", (event) => {
-        void handleFailure(event.error ?? new Error(event.message));
-      });
-    }
-
-    for (const { instance } of workers) {
-      if (!dispatchNext(instance)) {
+    for (const worker of workers) {
+      if (!dispatchNext(worker)) {
         break;
       }
     }
@@ -369,6 +370,89 @@ async function runWithWorkerPool(
     fileTimeMs,
     workerStats,
   };
+}
+
+function getWorkerSpawnSpec() {
+  const execPath = process.execPath;
+  const scriptPath = Bun.argv[1];
+  const isScriptRun =
+    typeof scriptPath === "string" &&
+    scriptPath.length > 0 &&
+    path.resolve(scriptPath) !== path.resolve(execPath);
+
+  if (isScriptRun) {
+    return {
+      command: execPath,
+      baseArgs: [scriptPath],
+    };
+  }
+
+  return {
+    command: execPath,
+    baseArgs: [],
+  };
+}
+
+function runWorkerChild(
+  spawnSpec: { command: string; baseArgs: string[] },
+  filePath: string,
+  scanMode: ScanMode,
+) {
+  return new Promise<{ result: ScanResult; durationMs: number }>((resolve, reject) => {
+    const child = spawn(
+      spawnSpec.command,
+      [
+        ...spawnSpec.baseArgs,
+        "--internal-scan-file",
+        filePath,
+        "--internal-scan-mode",
+        scanMode,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    child.on("error", (error) => {
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(
+          new Error(
+            `Worker scan failed for ${filePath}: ${stderr.trim() || `exit code ${code ?? "unknown"}`}`,
+          ),
+        );
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(stdout.trim()) as { result: ScanResult; durationMs: number };
+        resolve(parsed);
+      } catch (error) {
+        reject(
+          new Error(
+            `Worker scan produced invalid output for ${filePath}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+      }
+    });
+  });
 }
 
 function createProgressTracker(totalFiles: number, concurrency: number) {
